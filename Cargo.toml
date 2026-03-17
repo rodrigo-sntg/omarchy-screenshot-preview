@@ -1,6 +1,6 @@
 [package]
 name = "omarchy-screenshot-preview"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["Rodrigo Santiago <rodrigosntg@gmail.com>"]
 description = "macOS-style screenshot preview with drag-and-drop for Wayland/Hyprland"
