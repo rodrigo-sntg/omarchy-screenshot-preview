@@ -1,0 +1,16 @@
+[package]
+name = "omarchy-screenshot-preview"
+version = "0.1.0"
+edition = "2024"
+authors = ["Rodrigo Santiago <rodrigosntg@gmail.com>"]
+description = "macOS-style screenshot preview with drag-and-drop for Wayland/Hyprland"
+license = "MIT"
+repository = "https://github.com/rodrigosntg/omarchy-screenshot-preview"
+
+[dependencies]
+gtk4 = "0.10"
+gtk4-layer-shell = "0.7"
+
+[profile.release]
+strip = true
+lto = true
