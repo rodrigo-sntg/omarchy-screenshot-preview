@@ -11,11 +11,14 @@ use gtk4::{self as gtk, CssProvider};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
 const PREVIEW_WIDTH: i32 = 220;
+const DRAG_ICON_WIDTH: i32 = 120;
 const MARGIN_BOTTOM: i32 = 80;
 const MARGIN_RIGHT: i32 = 20;
 const DISMISS_MS: u64 = 5000;
 const FADE_STEP_MS: u64 = 16;
 const FADE_DURATION_MS: f64 = 300.0;
+
+type TimerHandle = Rc<Cell<Option<glib::SourceId>>>;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -53,6 +56,14 @@ fn main() {
     app.run_with_args::<String>(&[]);
 }
 
+fn scale_to_width(pixbuf: &gtk4::gdk_pixbuf::Pixbuf, width: i32, aspect: f64) -> gdk::Texture {
+    let height = (width as f64 * aspect) as i32;
+    let scaled = pixbuf
+        .scale_simple(width, height, gtk4::gdk_pixbuf::InterpType::Bilinear)
+        .expect("Failed to scale pixbuf");
+    gdk::Texture::for_pixbuf(&scaled)
+}
+
 fn build_ui(app: &gtk::Application, filepath: &str, editor_args: &[String]) {
     let win = gtk::ApplicationWindow::builder()
         .application(app)
@@ -61,7 +72,7 @@ fn build_ui(app: &gtk::Application, filepath: &str, editor_args: &[String]) {
         .build();
     win.set_widget_name("screenshot-preview");
 
-    // Layer shell setup
+    // Layer shell: overlay in bottom-right, no keyboard grab
     win.init_layer_shell();
     win.set_layer(Layer::Overlay);
     win.set_anchor(Edge::Bottom, true);
@@ -72,33 +83,17 @@ fn build_ui(app: &gtk::Application, filepath: &str, editor_args: &[String]) {
     win.set_namespace(Some("screenshot-preview"));
     win.set_keyboard_mode(KeyboardMode::None);
 
-    // Load and scale screenshot
+    // Load screenshot and create scaled textures
     let pixbuf =
         gtk4::gdk_pixbuf::Pixbuf::from_file(filepath).expect("Failed to load screenshot");
-    let orig_w = pixbuf.width() as f64;
-    let orig_h = pixbuf.height() as f64;
-    let aspect = orig_h / orig_w;
+    let aspect = pixbuf.height() as f64 / pixbuf.width() as f64;
     let preview_h = (PREVIEW_WIDTH as f64 * aspect) as i32;
 
-    let scaled = pixbuf
-        .scale_simple(
-            PREVIEW_WIDTH,
-            preview_h,
-            gtk4::gdk_pixbuf::InterpType::Bilinear,
-        )
-        .expect("Failed to scale pixbuf");
-    let texture = gdk::Texture::for_pixbuf(&scaled);
+    let texture = scale_to_width(&pixbuf, PREVIEW_WIDTH, aspect);
+    let drag_texture = scale_to_width(&pixbuf, DRAG_ICON_WIDTH, aspect);
 
     let image = gtk::Picture::for_paintable(&texture);
     image.set_size_request(PREVIEW_WIDTH, preview_h);
-
-    // Drag icon texture
-    let drag_w = 120;
-    let drag_h = (drag_w as f64 * aspect) as i32;
-    let drag_pixbuf = pixbuf
-        .scale_simple(drag_w, drag_h, gtk4::gdk_pixbuf::InterpType::Bilinear)
-        .expect("Failed to scale drag pixbuf");
-    let drag_texture = gdk::Texture::for_pixbuf(&drag_pixbuf);
 
     // Frame container
     let frame = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -132,145 +127,142 @@ fn build_ui(app: &gtk::Application, filepath: &str, editor_args: &[String]) {
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
 
-    // Shared state for timers
-    let dismiss_source: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
-    let fade_source: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
+    // Timer state
+    let dismiss_handle: TimerHandle = Rc::new(Cell::new(None));
+    let fade_handle: TimerHandle = Rc::new(Cell::new(None));
 
-    // --- Drag source ---
+    // Pre-cache drag data to avoid re-reading the file on every drag gesture
+    let uri = gtk4::gio::File::for_path(filepath).uri();
+    let uri_bytes = Rc::new(glib::Bytes::from(format!("{}\r\n", uri).as_bytes()));
+    let png_bytes = fs::read(filepath).ok().map(|v| Rc::new(glib::Bytes::from_owned(v)));
+
+    // Drag source
     let drag_source = gtk::DragSource::new();
     drag_source.set_actions(gdk::DragAction::COPY);
 
-    let filepath_for_drag = filepath.to_string();
-    drag_source.connect_prepare(move |_source, _x, _y| {
-        let file = gtk4::gio::File::for_path(&filepath_for_drag);
-        let uri = file.uri();
-        let uri_data = format!("{}\r\n", uri);
-
-        let uri_provider = gdk::ContentProvider::for_bytes(
-            "text/uri-list",
-            &glib::Bytes::from(uri_data.as_bytes()),
-        );
-
-        if let Ok(img_data) = fs::read(&filepath_for_drag) {
-            let png_provider =
-                gdk::ContentProvider::for_bytes("image/png", &glib::Bytes::from(&img_data));
-            Some(gdk::ContentProvider::new_union(&[uri_provider, png_provider]))
-        } else {
-            Some(uri_provider)
+    drag_source.connect_prepare({
+        let uri_bytes = uri_bytes.clone();
+        let png_bytes = png_bytes.clone();
+        move |_source, _x, _y| {
+            let uri_provider = gdk::ContentProvider::for_bytes("text/uri-list", &uri_bytes);
+            if let Some(ref bytes) = png_bytes {
+                let png_provider = gdk::ContentProvider::for_bytes("image/png", bytes);
+                Some(gdk::ContentProvider::new_union(&[uri_provider, png_provider]))
+            } else {
+                Some(uri_provider)
+            }
         }
     });
 
-    let dismiss_for_drag = dismiss_source.clone();
-    drag_source.connect_drag_begin(move |source, _drag| {
-        source.set_icon(Some(&drag_texture), 0, 0);
-        cancel_timer(&dismiss_for_drag);
+    drag_source.connect_drag_begin({
+        let dismiss_handle = dismiss_handle.clone();
+        move |source, _drag| {
+            source.set_icon(Some(&drag_texture), 0, 0);
+            cancel_timer(&dismiss_handle);
+        }
     });
 
-    let win_for_drag = win.clone();
-    let fade_for_drag = fade_source.clone();
-    drag_source.connect_drag_end(move |_source, _drag, _delete| {
-        start_fade_out(&win_for_drag, &fade_for_drag);
+    drag_source.connect_drag_end({
+        let win = win.clone();
+        let fade_handle = fade_handle.clone();
+        move |_source, _drag, _delete| {
+            start_fade(&win, &fade_handle, 1.0, 0.0, true);
+        }
     });
 
     frame.add_controller(drag_source);
 
-    // --- Click gesture ---
+    // Click: open editor and dismiss
     let click = gtk::GestureClick::new();
-    let editor_args_owned = editor_args.to_vec();
-    let dismiss_for_click = dismiss_source.clone();
-    let win_for_click = win.clone();
-    let fade_for_click = fade_source.clone();
-    click.connect_released(move |_gesture, _n, _x, _y| {
-        cancel_timer(&dismiss_for_click);
-        if let Some((cmd, args)) = editor_args_owned.split_first() {
-            let _ = Command::new(cmd).args(args).spawn();
+    click.connect_released({
+        let editor_args = editor_args.to_vec();
+        let dismiss_handle = dismiss_handle.clone();
+        let win = win.clone();
+        let fade_handle = fade_handle.clone();
+        move |_gesture, _n, _x, _y| {
+            cancel_timer(&dismiss_handle);
+            if let Some((cmd, args)) = editor_args.split_first() {
+                let _ = Command::new(cmd).args(args).spawn();
+            }
+            start_fade(&win, &fade_handle, 1.0, 0.0, true);
         }
-        start_fade_out(&win_for_click, &fade_for_click);
     });
     frame.add_controller(click);
 
-    // --- Hover: pause/resume dismiss ---
+    // Hover: pause/resume dismiss timer
     let motion = gtk::EventControllerMotion::new();
-    let dismiss_for_enter = dismiss_source.clone();
-    motion.connect_enter(move |_ctrl, _x, _y| {
-        cancel_timer(&dismiss_for_enter);
+    motion.connect_enter({
+        let dismiss_handle = dismiss_handle.clone();
+        move |_ctrl, _x, _y| {
+            cancel_timer(&dismiss_handle);
+        }
     });
-
-    let dismiss_for_leave = dismiss_source.clone();
-    let win_for_leave = win.clone();
-    let fade_for_leave = fade_source.clone();
-    motion.connect_leave(move |_ctrl| {
-        start_dismiss_timer(&win_for_leave, &dismiss_for_leave, &fade_for_leave);
+    motion.connect_leave({
+        let win = win.clone();
+        let dismiss_handle = dismiss_handle.clone();
+        let fade_handle = fade_handle.clone();
+        move |_ctrl| {
+            start_dismiss_timer(&win, &dismiss_handle, &fade_handle);
+        }
     });
     win.add_controller(motion);
 
     // Present with fade-in, then start dismiss timer
     win.set_opacity(0.0);
     win.present();
-    start_fade_in(&win, &fade_source);
-    start_dismiss_timer(&win, &dismiss_source, &fade_source);
+    start_fade(&win, &fade_handle, 0.0, 1.0, false);
+    start_dismiss_timer(&win, &dismiss_handle, &fade_handle);
 }
 
 // --- Timer helpers ---
 
-fn cancel_timer(source: &Rc<Cell<Option<glib::SourceId>>>) {
-    if let Some(id) = source.take() {
+fn cancel_timer(handle: &TimerHandle) {
+    if let Some(id) = handle.take() {
         id.remove();
     }
 }
 
 fn start_dismiss_timer(
     win: &gtk::ApplicationWindow,
-    dismiss_source: &Rc<Cell<Option<glib::SourceId>>>,
-    fade_source: &Rc<Cell<Option<glib::SourceId>>>,
+    dismiss_handle: &TimerHandle,
+    fade_handle: &TimerHandle,
 ) {
-    cancel_timer(dismiss_source);
+    cancel_timer(dismiss_handle);
     let win = win.clone();
-    let fade = fade_source.clone();
-    let id = glib::timeout_add_local_once(std::time::Duration::from_millis(DISMISS_MS), move || {
-        start_fade_out(&win, &fade);
-    });
-    dismiss_source.set(Some(id));
+    let fade_handle = fade_handle.clone();
+    let id = glib::timeout_add_local_once(
+        std::time::Duration::from_millis(DISMISS_MS),
+        move || {
+            start_fade(&win, &fade_handle, 1.0, 0.0, true);
+        },
+    );
+    dismiss_handle.set(Some(id));
 }
 
-fn start_fade_in(win: &gtk::ApplicationWindow, fade_source: &Rc<Cell<Option<glib::SourceId>>>) {
-    cancel_timer(fade_source);
+fn start_fade(
+    win: &gtk::ApplicationWindow,
+    fade_handle: &TimerHandle,
+    from: f64,
+    to: f64,
+    close_on_done: bool,
+) {
+    cancel_timer(fade_handle);
     let win = win.clone();
     let start = std::time::Instant::now();
     let id = glib::timeout_add_local(
         std::time::Duration::from_millis(FADE_STEP_MS),
         move || {
-            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-            let progress = (elapsed / FADE_DURATION_MS).min(1.0);
-            win.set_opacity(progress);
+            let progress = (start.elapsed().as_secs_f64() * 1000.0 / FADE_DURATION_MS).min(1.0);
+            win.set_opacity(from + (to - from) * progress);
             if progress >= 1.0 {
+                if close_on_done {
+                    win.close();
+                }
                 glib::ControlFlow::Break
             } else {
                 glib::ControlFlow::Continue
             }
         },
     );
-    fade_source.set(Some(id));
-}
-
-fn start_fade_out(win: &gtk::ApplicationWindow, fade_source: &Rc<Cell<Option<glib::SourceId>>>) {
-    cancel_timer(fade_source);
-    let win = win.clone();
-    let start_opacity = win.opacity();
-    let start = std::time::Instant::now();
-    let id = glib::timeout_add_local(
-        std::time::Duration::from_millis(FADE_STEP_MS),
-        move || {
-            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-            let progress = (elapsed / FADE_DURATION_MS).min(1.0);
-            win.set_opacity(start_opacity * (1.0 - progress));
-            if progress >= 1.0 {
-                win.close();
-                glib::ControlFlow::Break
-            } else {
-                glib::ControlFlow::Continue
-            }
-        },
-    );
-    fade_source.set(Some(id));
+    fade_handle.set(Some(id));
 }
